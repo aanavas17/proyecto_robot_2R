@@ -1,0 +1,133 @@
+clc;
+clear;
+close all;
+
+% Parámetros del robot
+l1 = 1; l2 = 1; % Longitudes de los eslabones
+m1 = 1; m2 = 1; % Masas de los eslabones
+g = 9.81;       % Gravedad
+x_eq = [pi/4; pi/6]; % Posición de equilibrio deseada
+Kp = diag([300, 300]); % Ganancia proporcional del PID
+Ki = diag([50, 50]);   % Ganancia integral del PID
+
+% Parámetros para regiones de estabilidad y tiempo constante
+alphas = [0.1, 0.2, 0.3, 0.4, 0.5]; % Factores de escalado de la inercia
+Ds = [5, 10, 20, 30, 40, 50, 60];   % Valores de amortiguación derivativa
+stability = zeros(length(alphas), length(Ds)); % Matriz de estabilidad
+T_values = zeros(length(alphas), length(Ds));  % Matriz para tiempos constantes
+
+% Simulación para cada combinación de \alpha y D
+for i = 1:length(alphas)
+    for j = 1:length(Ds)
+        alpha = alphas(i);
+        D = Ds(j);
+        Kd = diag([D, D]); % Ajustar amortiguación derivativa
+
+        % Ejecutar simulación
+        [t, x, error_t] = simulate_robot(alpha, Kp, Kd, Ki, x_eq, l1, l2, m1, m2, g);
+
+        % Calcular error final
+        error_final = error_t(end); % Error al final de la simulación
+        fprintf('Error final para α = %.2f y D = %.1f: %.5f\n', alpha, D, error_final);
+
+        % Evaluar estabilidad
+        if error_final < 0.01
+            stability(i, j) = 1; % Estable
+        else
+            stability(i, j) = 0; % Inestable
+        end
+
+        % Calcular tiempo constante T
+        e_0 = error_t(1); % Error inicial
+        threshold = 0.37 * e_0; % 37% del error inicial
+        T_idx = find(error_t <= threshold, 1); % Índice de T
+        if ~isempty(T_idx)
+            T_values(i, j) = t(T_idx); % Tiempo constante
+        else
+            T_values(i, j) = NaN; % No converge al umbral
+        end
+
+        % Mostrar valores de T para diagnóstico
+        fprintf('Tiempo constante para α = %.2f y D = %.1f: %.3f s\n', alpha, D, T_values(i, j));
+    end
+end
+
+% Gráfica de regiones de estabilidad
+figure;
+imagesc(Ds, alphas, stability);
+colorbar;
+xlabel('Amortiguación D [Ns/m]', 'FontSize', 12);
+ylabel('Factor de escala \alpha', 'FontSize', 12);
+title('Regiones de estabilidad', 'FontSize', 14);
+set(gca, 'YDir', 'normal'); % Asegurar orientación correcta
+
+% Gráfica del tiempo constante T
+figure;
+for i = 1:length(alphas)
+    plot(Ds, T_values(i, :), '-o', 'LineWidth', 1.5, 'MarkerSize', 8, ...
+        'DisplayName', sprintf('\\alpha = %.1f', alphas(i)));
+    hold on;
+end
+grid on;
+xlabel('Amortiguación D [Ns/m]', 'FontSize', 12);
+ylabel('Tiempo constante T [s]', 'FontSize', 12);
+title('Tiempo constante T vs. Amortiguación D', 'FontSize', 14);
+legend('show', 'Location', 'Best', 'FontSize', 10);
+
+% --- Función de simulación ---
+function [t, x, error_t] = simulate_robot(alpha, Kp, Kd, Ki, x_eq, l1, l2, m1, m2, g)
+    % Tiempo de simulación
+    tspan = linspace(0, 10, 1000);
+    
+    % Estado inicial (posición de equilibrio)
+    x0 = [x_eq(1); x_eq(2); 0; 0; 0; 0]; % Ángulos, velocidades, y error integral
+
+    % Ajuste del solver
+    options = odeset('RelTol', 1e-6, 'AbsTol', 1e-8);
+
+    % Resolver ecuaciones del sistema
+    [t, x] = ode45(@(t, x) dynamics(t, x, alpha, Kp, Kd, Ki, x_eq, l1, l2, m1, m2, g), tspan, x0, options);
+
+    % Calcular el error de seguimiento en cada instante
+    theta_desired = [x_eq(1); x_eq(2)];
+    error_t = sqrt((x(:, 1) - theta_desired(1)).^2 + (x(:, 2) - theta_desired(2)).^2);
+end
+
+% --- Dinámica del sistema ---
+function dx = dynamics(t, x, alpha, Kp, Kd, Ki, x_eq, l1, l2, m1, m2, g)
+    % Variables de estado
+    theta1 = x(1); theta2 = x(2);
+    theta_dot1 = x(3); theta_dot2 = x(4);
+    integral_error1 = x(5); integral_error2 = x(6);
+    
+    % Matriz de inercia escalada
+    M11 = alpha * (m1*l1^2/3 + m2*(l1^2 + l2^2/3 + l1*l2*cos(theta2)));
+    M12 = alpha * m2*(l2^2/3 + l1*l2*cos(theta2)/2);
+    M21 = M12;
+    M22 = alpha * m2*l2^2/3;
+    M = [M11, M12; M21, M22];
+
+    % Matriz de Coriolis y centrífuga
+    C1 = -alpha * m2*l1*l2*sin(theta2) * theta_dot2 * (2*theta_dot1 + theta_dot2);
+    C2 = alpha * m2*l1*l2*sin(theta2) * theta_dot1^2;
+    C = [C1; C2];
+
+    % Gravedad
+    G1 = (m1*l1/2 + m2*l1)*g*cos(theta1) + m2*l2*g*cos(theta1 + theta2)/2;
+    G2 = m2*l2*g*cos(theta1 + theta2)/2;
+    G = [G1; G2];
+
+    % Controlador PID
+    theta = [theta1; theta2];
+    theta_dot = [theta_dot1; theta_dot2];
+    error = theta - x_eq;
+    integral_error = [integral_error1; integral_error2] + error * 0.01;
+
+    tau_PD = -Kp*error - Kd*theta_dot; % Control proporcional-derivativo
+    tau_I = -Ki*integral_error;       % Control integral
+    tau = tau_PD + tau_I + G + C;    % Control total
+
+    % Dinámica del sistema
+    theta_ddot = M \ tau;
+    dx = [theta_dot; theta_ddot; error];
+end
